@@ -330,10 +330,12 @@ do
     parse[3] = function(bs, p)
         local text = readString(bs, readU16(bs))
         p.customNick = text ~= '' and text or nil
+        p.customNickUtf8 = nil
     end
 
     parse[4] = function(_, p)
         p.customNick = nil
+        p.customNickUtf8 = nil
     end
 
     parse[5] = function(bs, p)
@@ -413,7 +415,8 @@ do
     local Plugin = {}
     TagData.Plugin = Plugin
     do
-        local RECORDS = 0xEEEF0
+        -- _chat.asi 2026-11-01: player array moved; record layout is unchanged.
+        local RECORDS = 0xF2CD0
         local STRIDE = 0x1B0
         local BITS = {
             [0xb] = 0x100000, [0xd] = 0x80000, [0x11] = 0x40, [0x13] = 0x4000000,
@@ -496,6 +499,11 @@ do
             end
             status[7] = bit.band(bit.rshift(flags, 4), 3)
             status[0xc] = bit.band(flags, 0xF)
+
+            -- The plugin stores custom names as UTF-8, like titles and badges.
+            local customNick = readString(r + 0x12C)
+            p.customNick = customNick
+            p.customNickUtf8 = customNick ~= nil
 
             local title = readString(r + 0xE4)
             if title and title ~= '' then
@@ -1171,7 +1179,12 @@ do
     end
 
     local function nickRow(id, p, near, alpha, lineHeight)
-        local name = u8((p and p.customNick) or sampGetPlayerNickname(id))
+        local name
+        if p and p.customNick then
+            name = p.customNickUtf8 and p.customNick or u8(p.customNick)
+        else
+            name = u8(sampGetPlayerNickname(id))
+        end
         local row = newRow(lineHeight, alpha)
         local icons = nt.showIcons
         local space = lineHeight * 0.25
@@ -1682,9 +1695,7 @@ do
         check(nt, 'enabled', 'Свои таблички над игроками (/nt)', function(value)
             if not value then OriginalTags.restore() end
         end)
-        check(nt, 'hideOriginal', 'Скрывать стандартные ники SA-MP', function(value)
-            if not value then OriginalTags.restore() end
-        end)
+
         check(nt, 'stackTags', 'Раздвигать таблички, если наслаиваются')
         check(lb, 'enabled', 'Скрывать надписи лавок над игроками (/hl)')
         imgui.EndChild()
