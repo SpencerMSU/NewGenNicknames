@@ -188,6 +188,7 @@ local cfg = config.load('ui_tweaks', {
         fadeLen = 10.0,
         maxHp = 100,
         maxArmor = 100,
+        showNpcBars = true,
         showHpNumber = true,
         showArmorNumber = true,
         showIdBox = true,
@@ -481,6 +482,63 @@ do
             return moduleBase() ~= 0
         end
 
+        -- _chat.asi 2026-11-01: NPC table follows 1004 player records.
+        -- Render branch +0x36630: stride 0x8C; HP/armor/maxima at +0x68..0x74.
+        -- NPC IDs come from libcef's libPED::findPed(CPed*), as in the ASI.
+        local npcBase, npcFind, npcCheckedAt = 0, nil, -10
+        local npcStatus = 'не проверен'
+        pcall(ffi.cdef, 'void* __stdcall GetProcAddress(void* module, const char* name);')
+
+        function Plugin.npcAvailable()
+            local b = moduleBase()
+            if b ~= 0 and npcBase == b and npcFind then return true end
+            if os.clock() - npcCheckedAt < 5 then return false end
+            npcCheckedAt = os.clock()
+            npcStatus = '_chat.asi не найден'
+            if b == 0 then return false end
+            -- Disable this reader for unknown layouts after plugin updates.
+            local pe = memory.getuint32(b + 0x3C, false)
+            if pe < 0x40 or pe > 0x1000
+                or memory.getuint32(b + pe + 0x50, false) < 0x181000 then
+                npcStatus = 'неизвестная версия _chat.asi'
+                return false
+            end
+            local signature = '\x69\xC0\x8C\x00\x00\x00\x89\x75\xF0\x05\x40\x9E\x06\x00\x03\xC3'
+            if memory.tostring(b + 0x36637, #signature, false) ~= signature then
+                npcStatus = 'неизвестная версия _chat.asi'
+                return false
+            end
+            local cef = getModuleHandle('libcef.asi') or 0
+            npcStatus = 'libcef.asi не найден'
+            if cef == 0 then return false end
+            local proc = ffi.C.GetProcAddress(ffi.cast('void*', cef), '?findPed@libPED@@YAFPAX@Z')
+            npcStatus = 'API NPC не найден'
+            if proc == nil then return false end
+            npcFind = ffi.cast('int16_t (__cdecl *)(void*)', proc)
+            npcBase, npcStatus = b, 'читается'
+            return true
+        end
+
+        function Plugin.npcStatus()
+            Plugin.npcAvailable()
+            return npcStatus
+        end
+
+        function Plugin.readNpc(ped)
+            if not Plugin.npcAvailable() then return nil end
+            local pointer = getCharPointer(ped)
+            if not pointer or pointer == 0 then return nil end
+            local id = tonumber(npcFind(ffi.cast('void*', pointer)))
+            if id < 0 or id >= 1000 then return nil end
+            local r = npcBase + RECORDS + 0x69E40 + id * 0x8C
+            local hp, armor = memory.getfloat(r + 0x68, false), memory.getfloat(r + 0x6C, false)
+            local maxHp, maxArmor = memory.getfloat(r + 0x70, false), memory.getfloat(r + 0x74, false)
+            if not (finite(hp) and finite(armor) and finite(maxHp) and finite(maxArmor))
+                or hp <= 0 or maxHp <= 0 then return nil end
+            return {id = id, hp = hp, armor = math.max(0, armor), maxHp = maxHp,
+                maxArmor = maxArmor > 0 and maxArmor or cfg.nametags.maxArmor}
+        end
+
         function Plugin.read(id, p)
             local b = moduleBase()
             if b == 0 or id < 0 or id > 1003 then return false end
@@ -500,7 +558,6 @@ do
             status[7] = bit.band(bit.rshift(flags, 4), 3)
             status[0xc] = bit.band(flags, 0xF)
 
-            -- The plugin stores custom names as UTF-8, like titles and badges.
             local customNick = readString(r + 0x12C)
             p.customNick = customNick
             p.customNickUtf8 = customNick ~= nil
@@ -1525,6 +1582,20 @@ do
         end
     end
 
+    local function drawNpc(dl, e)
+        local alpha = clamp((NameTags.maxDist - e.dist) / nt.fadeLen, 0, 1)
+        if alpha <= 0 then return end
+        local p, w, h = e.npc, nt.barWidth, nt.barHeight
+        local total = p.armor > 0 and (w * 2 + 6) or w
+        local x, y = e.sx - total / 2, e.sy + 3
+        bar(dl, x, y, w, h, clamp(p.hp / p.maxHp, 0, 1), rgba(0.85, 0.2, 0.2, alpha),
+            nt.showHpNumber and tostring(math.floor(p.hp)) or nil, alpha)
+        if p.armor > 0 then
+            bar(dl, x + w + 6, y, w, h, clamp(p.armor / p.maxArmor, 0, 1), rgba(0.85, 0.85, 0.9, alpha),
+                nt.showArmorNumber and tostring(math.floor(p.armor)) or nil, alpha)
+        end
+    end
+
     function NameTags.draw()
         if Fonts.main then imgui.PushFont(Fonts.main) end
         local dl = imgui.GetBackgroundDrawList()
@@ -1533,11 +1604,12 @@ do
         local sampDistance = OriginalTags.distance()
         NameTags.maxDist = math.max(nt.maxDist, sampDistance)
         NameTags.nearDist = sampDistance > nt.maxDist and NameTags.maxDist or nt.nearDist
-        local entries = {}
+        local entries, playerPeds = {}, {[PLAYER_PED] = true}
         for id = 0, 1003 do
             if sampIsPlayerConnected(id) then
                 local ok, ped = sampGetCharHandleBySampPlayerId(id)
                 if ok and ped ~= PLAYER_PED and doesCharExist(ped) then
+                    playerPeds[ped] = true
                     local px, py, pz = getCharCoordinates(ped)
                     local dist = math.min(
                         getDistanceBetweenCoords3d(mx, my, mz, px, py, pz),
@@ -1552,11 +1624,42 @@ do
                 end
             end
         end
+        if nt.stackTags then
+            table.sort(entries, function(a, b) return a.dist < b.dist end)
+            layout(entries)
+        end
+        NameTags.npcCount = 0
+        if nt.showNpcBars and TagData.Plugin.npcAvailable() then
+            for _, ped in ipairs(getAllChars()) do
+                if not playerPeds[ped] and doesCharExist(ped) and not isCharDead(ped) then
+                    local px, py, pz = getCharCoordinates(ped)
+                    local dist = math.min(
+                        getDistanceBetweenCoords3d(mx, my, mz, px, py, pz),
+                        getDistanceBetweenCoords3d(cx, cy, cz, px, py, pz))
+                    if dist <= NameTags.maxDist then
+                        local hx, hy, hz = headBone.position(ped, px, py, pz)
+                        if isPointOnScreen(hx, hy, hz, 0.2) then
+                            local npc = TagData.Plugin.readNpc(ped)
+                            if npc then
+                                local sx, sy = convert3DCoordsToScreen(hx, hy, hz)
+                                if sx then
+                                    entries[#entries + 1] = {npc = npc, dist = dist, sx = sx, sy = sy}
+                                    NameTags.npcCount = NameTags.npcCount + 1
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
         table.sort(entries, function(a, b) return a.dist < b.dist end)
-        if nt.stackTags then layout(entries) end
         for i = #entries, 1, -1 do
             local e = entries[i]
-            drawPlayer(dl, e.id, e.ped, e.dist, e.sx, e.sy)
+            if e.npc then
+                drawNpc(dl, e)
+            else
+                drawPlayer(dl, e.id, e.ped, e.dist, e.sx, e.sy)
+            end
         end
         if Fonts.main then imgui.PopFont() end
     end
@@ -1697,6 +1800,7 @@ do
         end)
 
         check(nt, 'stackTags', 'Раздвигать таблички, если наслаиваются')
+        check(nt, 'showNpcBars', 'Полоски здоровья NPC')
         check(lb, 'enabled', 'Скрывать надписи лавок над игроками (/hl)')
         imgui.EndChild()
 
@@ -1914,6 +2018,7 @@ function main()
             if p.bubble then bubbles = bubbles + 1 end
             if p.hp then stats = stats + 1 end
         end
+        say(('NPC: %s, на экране %d'):format(TagData.Plugin.npcStatus(), NameTags.npcCount or 0))
         local icons = Icons.count()
         say(('_chat.asi: %s, игроков %d, с HP %d, с фамой %d, с облачком %d, шрифт: %s, иконок: %d'):format(TagData.Plugin.available() and 'читается' or 'не найден', count, stats, titled, bubbles, Fonts.main and 'есть' or 'нет', icons))
     end)
